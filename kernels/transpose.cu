@@ -8,16 +8,43 @@
 #include <string>
 #include <vector>
 
-// Naive n x n transpose: reads are coalesced (consecutive threads read
-// consecutive input), writes are strided by n. This is the classic starting
-// rung — the optimization ladder is shared-memory tiles, then padding the
-// tile to kill bank conflicts. Edit this kernel and its launch configuration
-// while experimenting.
-__global__ void transpose(const float* input, float* output, size_t n) {
-    const size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row < n && col < n) {
-        output[col * n + row] = input[row * n + col];
+// Tiled n x n transpose: a TILE x TILE shared-memory tile staged so both
+// global reads and global writes are coalesced. The tile is padded to
+// [TILE][TILE + 1] so the transposed shared-memory access pattern is
+// bank-conflict free. Each TILE x BLOCK_ROWS thread block is coarsened:
+// every thread loads/stores TILE / BLOCK_ROWS rows of the tile. Bounds
+// checks on both phases handle the n=8195 tail tiles.
+constexpr int TILE = 64;
+constexpr int BLOCK_ROWS = 8;
+
+__global__ void transpose(
+    const float* __restrict__ input, float* __restrict__ output, size_t n) {
+    __shared__ float tile[TILE][TILE + 1];
+
+    const size_t x_in = blockIdx.x * size_t{TILE} + threadIdx.x;
+    const size_t y_in = blockIdx.y * size_t{TILE} + threadIdx.y;
+
+    if (x_in < n) {
+#pragma unroll
+        for (int j = 0; j < TILE; j += BLOCK_ROWS) {
+            if (y_in + j < n) {
+                tile[threadIdx.y + j][threadIdx.x] = input[(y_in + j) * n + x_in];
+            }
+        }
+    }
+
+    __syncthreads();
+
+    const size_t x_out = blockIdx.y * size_t{TILE} + threadIdx.x;
+    const size_t y_out = blockIdx.x * size_t{TILE} + threadIdx.y;
+
+    if (x_out < n) {
+#pragma unroll
+        for (int j = 0; j < TILE; j += BLOCK_ROWS) {
+            if (y_out + j < n) {
+                output[(y_out + j) * n + x_out] = tile[threadIdx.x][threadIdx.y + j];
+            }
+        }
     }
 }
 
@@ -27,7 +54,7 @@ int main(int argc, char** argv) {
     // does not fit in cache.
     const size_t n = argc > 1 ? std::stoull(argv[1]) : 4099;
     constexpr uint32_t seed = 20260813;
-    const dim3 threads(32, 8);
+    const dim3 threads(TILE, BLOCK_ROWS);
 
     try {
         cuda_harness::require_gpu_or_exit();
@@ -59,7 +86,8 @@ int main(int argc, char** argv) {
         const auto blocks_for = [](size_t extent, unsigned block) {
             return static_cast<unsigned>((extent + block - 1) / block);
         };
-        const dim3 blocks(blocks_for(n, threads.x), blocks_for(n, threads.y));
+        // Each block covers a TILE x TILE tile regardless of blockDim.y.
+        const dim3 blocks(blocks_for(n, TILE), blocks_for(n, TILE));
         auto launch = [&] {
             transpose<<<blocks, threads>>>(
                 device_input.data(), device_output.data(), n);
