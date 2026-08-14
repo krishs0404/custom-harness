@@ -24,7 +24,8 @@ has the full story.
 
 ```bash
 make run KERNEL=<name> [N=...] [NOTE="..."]   # verify + time + append to log
-make profile KERNEL=<name>                    # ncu diagnosis (bare metal only)
+make profile KERNEL=<name>                    # ncu diagnosis (bare metal/VM only)
+make profile-remote HOST=user@gpubox          # same, via SSH; CSV saved locally
 make sanitize KERNEL=<name>                   # memcheck + racecheck
 python3 -m modal run modal/run_kernel.py \
     --kernel <name> --n <N> --note "..."      # same loop on a Modal GPU;

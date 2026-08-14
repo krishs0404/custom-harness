@@ -94,6 +94,24 @@ unlock-clocks:
 	sudo nvidia-smi --reset-memory-clocks 2>/dev/null || true; \
 	rm -f build/.clocks_locked
 
+# ncu needs direct hardware access (sandboxed providers block it — README).
+# Runs the profile on a remote GPU box over SSH and saves the CSV locally.
+# Usage: make profile-remote HOST=user@gpubox [SSH_KEY=~/.ssh/key] [KERNEL=] [N=]
+HOST ?=
+SSH_KEY ?=
+SSH_FLAGS := $(if $(SSH_KEY),-i $(SSH_KEY) -o IdentitiesOnly=yes)
+
+profile-remote:
+	@test -n "$(HOST)" || { echo "usage: make profile-remote HOST=user@gpubox [SSH_KEY=...]" >&2; exit 1; }
+	@mkdir -p build
+	rsync -az -e "ssh $(SSH_FLAGS)" --exclude build --exclude .git \
+	  --exclude results.jsonl ./ $(HOST):.cuda-harness-remote/
+	ssh $(SSH_FLAGS) $(HOST) 'cd .cuda-harness-remote && make build KERNEL=$(KERNEL) >/dev/null \
+	  && sudo HARNESS_MODE=check $$(command -v ncu) --section SpeedOfLight \
+	  --section MemoryWorkloadAnalysis --launch-skip 1 --launch-count 1 \
+	  --csv ./build/$(KERNEL) $(N)' | tee build/$(KERNEL)-profile.csv >/dev/null
+	@echo "saved build/$(KERNEL)-profile.csv" >&2
+
 # results.jsonl survives clean: it is measurement history, not a build product.
 clean:
 	rm -rf build

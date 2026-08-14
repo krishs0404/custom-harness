@@ -108,8 +108,14 @@ registration story.
   (verified on Modal: root, `RmProfilingAdminOnly: 0`, yet ncu still fails
   with "failed to prepare kernel") do not pass the profiler's device ioctls
   through their runtime, and hardware counters are a cross-tenant
-  side-channel besides. Profile on bare metal or a full VM; on shared hosts,
-  the directional ceilings above are the fallback diagnosis.
+  side-channel besides. Profile on bare metal or a full VM (verified on a
+  Lambda H100 VM; when the driver sets `RmProfilingAdminOnly: 1`, run ncu
+  under sudo). On shared hosts, the directional ceilings above are the
+  fallback diagnosis.
+- `make profile-remote HOST=user@gpubox [SSH_KEY=...]` rsyncs the repo to
+  an SSH-reachable GPU machine, profiles there, and saves the CSV to
+  `build/<kernel>-profile.csv` locally — the plateau-moment workflow when
+  day-to-day iteration happens on a sandboxed provider.
 
 ## Roadmap (known, deliberately deferred)
 
