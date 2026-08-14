@@ -104,6 +104,24 @@ registration story.
   JSON line.
 - Exit codes: `0` ok, `1` wrong answer or error, `77` no usable GPU (skip),
   `2` sanitizer findings.
+- `make profile` requires direct hardware access. Sandboxed GPU providers
+  (verified on Modal: root, `RmProfilingAdminOnly: 0`, yet ncu still fails
+  with "failed to prepare kernel") do not pass the profiler's device ioctls
+  through their runtime, and hardware counters are a cross-tenant
+  side-channel besides. Profile on bare metal or a full VM; on shared hosts,
+  the directional ceilings above are the fallback diagnosis.
+
+## Roadmap (known, deliberately deferred)
+
+- Multi-shape correctness sweep (`make check` over several N) — anti-
+  overfitting once agents run less supervised.
+- Optional per-kernel library baseline (cuBLAS/CUB) timed under identical
+  conditions — the true "can we do better" ceiling.
+- FLOP-side speed-of-light for compute-bound kernels.
+- GPU UUID + live SM clock in the JSON line, to attribute run-to-run
+  denominator wobble.
+- Code-enforced agent run budgets — an orchestration concern that stays
+  outside this repo by design.
 
 The design borrows the small, load-bearing ideas from recent work:
 verifier-first execution and deterministic control from
