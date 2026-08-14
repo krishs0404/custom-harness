@@ -16,13 +16,26 @@ make sanitize KERNEL=vector_add  # memcheck + racecheck before trusting a win
 Edit `kernels/<name>.cu`, `make run`, read the numbers, `make profile` when
 you need to know why, edit again. Every successful `make run` appends one
 JSON line (median, GB/s, % of peak, git SHA, timestamp) to `results.jsonl` —
-the optimization trajectory is a file, not a memory.
+the optimization trajectory is a file, not a memory. Label attempts with
+`NOTE="64x64 padded tile"`; the note lands in the JSON line, making the log
+a self-documenting attempt table.
 
 `make run` output ends with the speed-of-light line, for example:
 
 ```
-median 8.412 us  1495.8 GB/s  20.9% of measured peak (7150.0 GB/s)
+median 116.090 us  4628.0 GB/s  77.0% of measured peak (copy 6011.0, read 6300.2, write 5850.7 GB/s)
 ```
+
+No GPU on this machine? `modal/run_kernel.py` runs the same targets on a
+Modal GPU (default B200) and appends the JSON line to the **local**
+`results.jsonl`, so history survives the ephemeral container:
+
+```bash
+python3 -m modal run modal/run_kernel.py --kernel transpose --n 8195 --note "attempt label"
+```
+
+The driver is optional infrastructure, not the verifier — timing and
+verification live entirely in `harness.cuh` + the Makefile.
 
 ## When are you done?
 
@@ -32,6 +45,15 @@ device-to-device copy run in the same process; the gap between it and
 `pct_theoretical_peak` (datasheet clock × bus width) is vendor/physics tax,
 not your problem. A perfectly coalesced streaming kernel can land slightly
 above 100% of the copy proxy; that also means done.
+
+The JSON also reports **directional ceilings** (`read_peak_gbps` from a
+load-only sweep, `write_peak_gbps` from a memset). Judge a kernel against
+the mix it actually performs: one that streams reads but scatters writes is
+bounded by something between the two, and the copy number alone will
+under-explain the gap. When one direction's achieved bandwidth is near its
+ceiling and the other is far below, the far one is the lever — that is a
+profiler-grade diagnosis with no profiler, which matters on hosts (Modal)
+that block ncu's counters.
 
 If the percentage is low, `make profile` says why:
 
@@ -57,7 +79,9 @@ registration story.
 ## Contract for agents (Sol Ultra, Fable — read this)
 
 - You may edit files under `kernels/` only. Do not touch `harness.cuh`, the
-  `Makefile`, or `results.jsonl`.
+  `Makefile`, `results.jsonl`, or `modal/`.
+- Label every measured attempt: `NOTE="what changed"` (or `--note` via the
+  Modal driver). Unlabeled log lines are indistinguishable later.
 - Success is `make run` printing `"status":"ok"` with a lower `median_us`
   than the previous entry in `results.jsonl` for the same kernel and N.
 - The output buffer is NaN-poisoned before correctness checking **and

@@ -6,6 +6,7 @@ NCU ?= ncu
 ARCH ?= native
 KERNEL ?= vector_add
 N ?=
+NOTE ?=
 GPU_CLOCK ?=
 NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
 
@@ -51,7 +52,7 @@ run: build
 	    echo "WARNING: GPU clocks not locked; run 'make lock-clocks' for stable numbers" >&2; \
 	  fi; \
 	fi; \
-	HARNESS_CLOCKS=$$clocks ./$(BIN) $(N) | tee -a results.jsonl
+	HARNESS_CLOCKS=$$clocks HARNESS_NOTE="$${HARNESS_NOTE:-$(NOTE)}" ./$(BIN) $(N) | tee -a results.jsonl
 
 # Diagnosis only, never timing: HARNESS_MODE=check skips the timing loop and
 # JSON, and --launch-skip 1 skips the correctness launch, so ncu profiles one

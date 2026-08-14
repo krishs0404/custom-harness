@@ -204,36 +204,91 @@ inline std::optional<double> theoretical_peak_gbps(int device = 0) {
     return clock_khz * 1.0e3 * 2.0 * (bus_bits / 8.0) / 1.0e9;
 }
 
-// Achievable ceiling: a saturating device-to-device copy sweep. Max of five
-// reps because we want the ceiling, not the typical rep. A perfectly
-// coalesced streaming kernel can slightly beat this (README explains).
-inline double measured_peak_gbps() {
-    const size_t bytes = size_t{256} << 20;  // 256 MiB per buffer
+// Achievable ceilings, measured three ways so a low kernel number is a
+// diagnosis, not just a verdict:
+//   copy  — D2D memcpy, reads and writes every byte (the classic proxy);
+//   read  — a grid-stride sweep kernel that only loads;
+//   write — a memset that only stores.
+// A kernel that streams reads but scatters writes should be judged against
+// the directional ceilings, not only the copy number. Max of five reps
+// because we want the ceiling, not the typical rep; buffers are 4x larger
+// than any current L2, and sequential sweeps self-evict, so these are DRAM
+// numbers.
+struct MemoryPeaks {
+    double copy_gbps = 0.0;
+    double read_gbps = 0.0;
+    double write_gbps = 0.0;
+};
+
+__global__ void read_sweep_kernel(
+    const float4* __restrict__ data, size_t count, float* sink) {
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const size_t stride = size_t{gridDim.x} * blockDim.x;
+    for (size_t i = size_t{blockIdx.x} * blockDim.x + threadIdx.x; i < count;
+         i += stride) {
+        const float4 value = data[i];
+        acc.x += value.x;
+        acc.y += value.y;
+        acc.z += value.z;
+        acc.w += value.w;
+    }
+    const float total = acc.x + acc.y + acc.z + acc.w;
+    // Never true for the zero-filled buffer, but the compiler cannot prove
+    // that, so the loads survive dead-code elimination.
+    if (total == -1.0f) {
+        *sink = total;
+    }
+}
+
+inline MemoryPeaks measure_memory_peaks() {
+    const size_t bytes = size_t{512} << 20;  // 512 MiB per buffer
     DeviceBuffer<unsigned char> source(bytes);
     DeviceBuffer<unsigned char> destination(bytes);
-
-    for (int i = 0; i < 2; ++i) {
-        CUDA_CHECK(cudaMemcpy(
-            destination.data(), source.data(), bytes, cudaMemcpyDeviceToDevice));
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DeviceBuffer<float> sink(1);
+    CUDA_CHECK(cudaMemset(source.data(), 0, bytes));
 
     Event start;
     Event stop;
-    double best_gbps = 0.0;
-    for (int rep = 0; rep < 5; ++rep) {
-        CUDA_CHECK(cudaEventRecord(start));
-        CUDA_CHECK(cudaMemcpy(
-            destination.data(), source.data(), bytes, cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float elapsed_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        // A copy reads and writes every byte, hence 2x.
-        const double gbps = 2.0 * bytes / (elapsed_ms * 1.0e-3) / 1.0e9;
-        best_gbps = std::max(best_gbps, gbps);
-    }
-    return best_gbps;
+    const auto best_of_five = [&](auto op, double bytes_per_op) {
+        for (int i = 0; i < 2; ++i) {
+            op();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double best_gbps = 0.0;
+        for (int rep = 0; rep < 5; ++rep) {
+            CUDA_CHECK(cudaEventRecord(start));
+            op();
+            CUDA_CHECK(cudaEventRecord(stop));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+            const double gbps = bytes_per_op / (elapsed_ms * 1.0e-3) / 1.0e9;
+            best_gbps = std::max(best_gbps, gbps);
+        }
+        return best_gbps;
+    };
+
+    MemoryPeaks peaks;
+    peaks.copy_gbps = best_of_five(
+        [&] {
+            CUDA_CHECK(cudaMemcpy(
+                destination.data(), source.data(), bytes,
+                cudaMemcpyDeviceToDevice));
+        },
+        2.0 * bytes);
+    peaks.write_gbps = best_of_five(
+        [&] { CUDA_CHECK(cudaMemset(destination.data(), 0, bytes)); },
+        1.0 * bytes);
+    const size_t count = bytes / sizeof(float4);
+    peaks.read_gbps = best_of_five(
+        [&] {
+            read_sweep_kernel<<<2048, 256>>>(
+                reinterpret_cast<const float4*>(source.data()), count,
+                sink.data());
+        },
+        1.0 * bytes);
+    return peaks;
 }
 
 inline std::string device_name(int device = 0) {
@@ -259,10 +314,26 @@ struct Result {
     double bytes_moved = 0.0;
     double gbps = 0.0;
     std::optional<double> theoretical_peak_gbps;
-    double measured_peak_gbps = 0.0;
+    MemoryPeaks peaks;
     std::string clocks;
     std::string device;
+    std::string note;
 };
+
+inline std::string escape_json(const std::string& text) {
+    std::string out;
+    for (const char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n' || c == '\r' || c == '\t') {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
 
 // Single owner of the JSON schema. One line on stdout and nothing else, so
 // `make run` can append stdout verbatim to results.jsonl.
@@ -292,14 +363,19 @@ inline void print_result_json(const Result& result) {
     } else {
         out << ",\"theoretical_peak_gbps\":null,\"pct_theoretical_peak\":null";
     }
-    out << ",\"measured_peak_gbps\":" << result.measured_peak_gbps
+    out << ",\"measured_peak_gbps\":" << result.peaks.copy_gbps
         << ",\"pct_measured_peak\":"
-        << 100.0 * result.gbps / result.measured_peak_gbps
+        << 100.0 * result.gbps / result.peaks.copy_gbps
+        << ",\"read_peak_gbps\":" << result.peaks.read_gbps
+        << ",\"write_peak_gbps\":" << result.peaks.write_gbps
         << ",\"clocks\":\"" << result.clocks << "\""
         << ",\"git_sha\":\"" << HARNESS_GIT_SHA << "\""
         << ",\"dirty\":" << (HARNESS_GIT_DIRTY ? "true" : "false")
-        << ",\"device\":\"" << result.device << "\""
-        << ",\"timestamp\":\"" << utc_timestamp() << "\"}";
+        << ",\"device\":\"" << result.device << "\"";
+    if (!result.note.empty()) {
+        out << ",\"note\":\"" << escape_json(result.note) << "\"";
+    }
+    out << ",\"timestamp\":\"" << utc_timestamp() << "\"}";
     std::cout << out.str() << std::endl;
 }
 
@@ -370,10 +446,10 @@ int run_and_report(
         return 0;
     }
 
-    // Ceilings before warmup, so the copy sweep's cache pollution cannot
+    // Ceilings before warmup, so the proxy sweeps' cache pollution cannot
     // touch the timed region.
     Result result;
-    result.measured_peak_gbps = measured_peak_gbps();
+    result.peaks = measure_memory_peaks();
     result.theoretical_peak_gbps = theoretical_peak_gbps();
 
     result.samples_us = benchmark(
@@ -390,15 +466,18 @@ int run_and_report(
     result.gbps = config.bytes_moved / (result.median_us * 1.0e-6) / 1.0e9;
     result.clocks = clocks != nullptr ? clocks : "unknown";
     result.device = device_name();
+    const char* note = std::getenv("HARNESS_NOTE");
+    result.note = note != nullptr ? note : "";
 
     std::cerr.setf(std::ios::fixed);
     std::cerr.precision(3);
     std::cerr << "median " << result.median_us << " us  ";
     std::cerr.precision(1);
     std::cerr << result.gbps << " GB/s  "
-              << 100.0 * result.gbps / result.measured_peak_gbps
-              << "% of measured peak (" << result.measured_peak_gbps
-              << " GB/s)\n";
+              << 100.0 * result.gbps / result.peaks.copy_gbps
+              << "% of measured peak (copy " << result.peaks.copy_gbps
+              << ", read " << result.peaks.read_gbps
+              << ", write " << result.peaks.write_gbps << " GB/s)\n";
     print_result_json(result);
     return 0;
 }
