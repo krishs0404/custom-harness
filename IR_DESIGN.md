@@ -15,15 +15,18 @@ KV cache `[B, H_kv, L, D]`. Output `O[B, H_q, D]`.
 
 ## 1. First-principles analysis (what "ideal" means here)
 
-- **Traffic:** K+V = 2 x B x H_kv x L x D x 2B = **268.4 MB** must be read
+- **Traffic:** K+V = 2 x B x H_kv x L x D x 2B = **134.2 MB** must be read
   once. Q and O are ~32 KB each — noise.
 - **Compute:** 4 x B x H_q x L x D ≈ **0.54 GFLOP**.
-- **Intensity:** ~2 FLOP/byte vs a B200 BF16 ridge of ~280 → as
+- **Intensity:** ~4 FLOP/byte vs a B200 BF16 ridge of ~280 → as
   memory-bound as kernels get. GQA's G=4 sharing is already counted (each
   KV element serves 4 query heads; MHA would read 4x more).
-- **Speed of light:** 268.4 MB / read ceiling (~6.2 TB/s measured proxy)
-  ≈ **43-45 us**. The harness's read_peak_gbps is the honest denominator;
-  pct_measured_peak vs the copy proxy will understate this kernel.
+- **Speed of light:** 134.2 MB / read ceiling (~6.2 TB/s measured proxy)
+  ≈ **21.5-22 us**. The harness's read_peak_gbps is the honest
+  denominator; pct_measured_peak vs the copy proxy will understate this
+  kernel. (An earlier revision of this doc said 268 MB / ~44 us — an
+  arithmetic error, caught when the baseline lane's independently
+  computed bytes_moved disagreed.)
 - **Parallelism problem:** natural work units = B x H_kv = **32** vs 148
   SMs on B200. An unsplit kernel leaves >75% of the chip idle — this is
   THE decode pathology (Flash-Decoding's 36-43x win is exactly this fix).
@@ -40,9 +43,17 @@ KV cache `[B, H_kv, L, D]`. Output `O[B, H_q, D]`.
 S=8-16 (256-512 CTAs, ~2-3 waves), tile_rows=64, stages=3, TMA loads,
 8 warps uniform (no warp specialization needed at this pipeline depth),
 FMA score path, conditional softmax rescale, two-kernel combine.
-Predicted time ~45-50 us (≥90% of read ceiling). If enumeration finds
+Predicted time ~23-26 us (≥90% of read ceiling). If enumeration finds
 something meaningfully better, the analysis above was wrong somewhere —
 which is the interesting outcome.
+
+Measured context (baseline lane, B200, 2026-08-16): torch SDPA (cuDNN
+backend) 29.4 us = ~73% of read ceiling — the number to beat; SDPA flash
+backend 42.4 us; FlashInfer paged decode 50.6 us on first measurement
+(suspected lane misconfiguration — tensor-core GQA path not enabled;
+being re-measured); FlexAttention 322 us (generic template, decode path
+not engaged — a known caveat of the lane, not FlexDecoding's best);
+eager 594 us.
 
 ## 2. The mini IR
 
@@ -123,7 +134,7 @@ training set assembles itself).
   spec embedded as a header comment and as the run's NOTE. Both passes
   (main + combine) live in one .cu; the launch lambda runs main then
   combine so the harness times the pair — bytes_moved accounts for both
-  (partials add S x 66 KB ≈ ≤2 MB, <1% of 268 MB).
+  (partials add S x 66 KB ≈ ≤2 MB, <2% of 134 MB).
 - Verified by the existing harness unchanged: CPU FP64 reference,
   poison / validate / time / re-validate. Tolerance pinned during task
   authoring per EXPERIMENT.md (proposal to validate empirically: abs err
@@ -135,7 +146,7 @@ training set assembles itself).
 ## 6. What this buys, in order
 
 1. **A certainty result:** the best schedule in the family, found by
-   exhaustive search, vs the ~44 us speed of light — no agent luck
+   exhaustive search, vs the ~22 us speed of light — no agent luck
    involved. Either the predicted-ideal spec wins (analysis validated)
    or something surprising does (better outcome).
 2. **A baseline-calibrated artifact:** the winning kernel vs torch SDPA /
