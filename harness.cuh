@@ -166,18 +166,22 @@ void poison(T* device_ptr, size_t count) {
     CUDA_CHECK(cudaMemset(device_ptr, 0xff, count * sizeof(T)));
 }
 
+// Comparison happens in double so T only needs a conversion to float
+// (covers float, double, __nv_bfloat16, __half alike).
 template <typename T>
 bool validate(
     const std::vector<T>& actual,
     const std::vector<T>& expected,
-    T tolerance) {
-    T max_error = 0;
+    double tolerance) {
+    double max_error = 0.0;
     for (size_t i = 0; i < actual.size(); ++i) {
-        const T error = std::abs(actual[i] - expected[i]);
+        const double a = static_cast<double>(static_cast<float>(actual[i]));
+        const double e = static_cast<double>(static_cast<float>(expected[i]));
+        const double error = std::abs(a - e);
         max_error = std::max(max_error, error);
-        if (!std::isfinite(actual[i]) || error > tolerance) {
-            std::cerr << "wrong value at " << i << ": got " << actual[i]
-                      << ", expected " << expected[i] << '\n';
+        if (!std::isfinite(a) || error > tolerance) {
+            std::cerr << "wrong value at " << i << ": got " << a
+                      << ", expected " << e << '\n';
             return false;
         }
     }
@@ -389,7 +393,7 @@ struct RunConfig {
     // The kernel's declared traffic (e.g. 3 * n * sizeof(float) for c=a+b).
     // Part of the problem statement, not the optimization surface.
     double bytes_moved = 0.0;
-    float tolerance = 1.0e-6f;
+    double tolerance = 1.0e-6;
     int warmups = 10;
     int samples = 15;
     // Batched so sub-10 us kernels are not dominated by event resolution.
@@ -427,7 +431,7 @@ int run_and_report(
         CUDA_CHECK(cudaMemcpy(
             actual.data(), device_output, count * sizeof(T),
             cudaMemcpyDeviceToHost));
-        return validate(actual, expected, static_cast<T>(config.tolerance));
+        return validate(actual, expected, config.tolerance);
     };
 
     if (!launch_and_validate()) {
